@@ -29,7 +29,16 @@ app.add_middleware(
 
 @app.get("/health")
 def health() -> Dict[str, Any]:
-    return {"status": "ok", "demo_mode": settings.demo_mode}
+    llm_status = workflow.llm.status()
+    return {
+        "status": "ok",
+        "demo_mode": settings.demo_mode,
+        "analysis_mode": "multi_agent_llm_team" if llm_status["enabled"] else "llm_agent_team_unconfigured",
+        "openai_enabled": llm_status["enabled"],
+        "openai_configured": llm_status["configured"],
+        "openai_model": llm_status["model"],
+        "llm_required": True,
+    }
 
 
 @app.get(f"{settings.api_prefix}/cases", response_model=CaseListResponse)
@@ -40,6 +49,17 @@ def list_cases() -> CaseListResponse:
 @app.post(f"{settings.api_prefix}/cases/intake", response_model=CaseState)
 def intake(payload: IntakePayload) -> CaseState:
     return repository.create_case(payload)
+
+
+@app.post(f"{settings.api_prefix}/analyze", response_model=CaseState)
+def analyze(payload: IntakePayload) -> CaseState:
+    case = repository.create_case(payload)
+    try:
+        return workflow.run(case)
+    except Exception as exc:
+        case.status = CaseStatus.failed
+        repository.save_case(case)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post(f"{settings.api_prefix}/opensearch/webhook", response_model=CaseState)

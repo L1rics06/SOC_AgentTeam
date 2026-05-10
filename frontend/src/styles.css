@@ -222,14 +222,17 @@ button {
 
 .agent-stack,
 .evidence-list,
-.approval-list {
+.approval-list,
+.mailbox-list {
   display: grid;
   gap: 10px;
 }
 
 .agent-row,
 .evidence-row,
-.approval-row {
+.approval-row,
+.message-row,
+.empty-panel {
   background: #ffffff;
   border: 1px solid #d9e1e5;
   border-radius: 8px;
@@ -244,6 +247,22 @@ button {
   gap: 12px;
 }
 
+.message-row div {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+
+.message-row span {
+  color: #667782;
+}
+
+.message-row small {
+  color: #2563eb;
+  margin-left: auto;
+}
+
 .agent-heading span {
   color: #0c766d;
   font-weight: 700;
@@ -251,7 +270,9 @@ button {
 
 .agent-row p,
 .approval-row p,
-.evidence-row p {
+.evidence-row p,
+.message-row p,
+.empty-panel {
   color: #40515b;
   line-height: 1.5;
 }
@@ -332,4 +353,3 @@ button {
     grid-template-columns: repeat(2, 1fr);
   }
 }
-

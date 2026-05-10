@@ -146,6 +146,23 @@ export default function App() {
                     <AgentRow key={output.task_id} output={output} />
                   ))}
                 </div>
+                <SectionTitle title="Team Mailbox" />
+                <div className="mailbox-list">
+                  {(selected.team_messages || []).length === 0 ? (
+                    <div className="empty-panel">No team messages yet</div>
+                  ) : (
+                    selected.team_messages.map((message) => (
+                      <article className="message-row" key={message.message_id}>
+                        <div>
+                          <b>{message.from_agent}</b>
+                          <span>{message.to_agent}</span>
+                          <small>{message.message_type}</small>
+                        </div>
+                        <p>{message.content}</p>
+                      </article>
+                    ))
+                  )}
+                </div>
                 <SectionTitle title="Final Report" />
                 <pre className="report">{selected.final_report || "Report pending"}</pre>
               </div>
@@ -229,4 +246,3 @@ function AgentRow({ output }: { output: AgentEnvelope }) {
     </article>
   );
 }
-

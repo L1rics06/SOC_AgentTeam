@@ -37,6 +37,16 @@ export interface AgentEnvelope {
   metadata: Record<string, unknown>;
 }
 
+export interface TeamMessage {
+  message_id: string;
+  from_agent: string;
+  to_agent: string;
+  message_type: string;
+  content: string;
+  evidence_refs: EvidenceRef[];
+  created_at: string;
+}
+
 export interface ReadinessReport {
   readiness_score: number;
   gate: ReadinessGate;
@@ -56,10 +66,10 @@ export interface CaseState {
   labels: string[];
   evidence_refs: EvidenceRef[];
   readiness?: ReadinessReport;
+  team_messages: TeamMessage[];
   agent_outputs: AgentEnvelope[];
   approvals: RecommendedAction[];
   final_report?: string;
   created_at: string;
   updated_at: string;
 }
-

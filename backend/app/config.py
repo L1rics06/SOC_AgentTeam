@@ -16,6 +16,14 @@ class Settings(BaseSettings):
     cors_origins: List[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
 
     demo_mode: bool = True
+
+    openai_enabled: bool = False
+    openai_api_key: Optional[str] = None
+    openai_base_url: Optional[str] = None
+    openai_model: str = "gpt-4o-mini"
+    openai_timeout_seconds: float = 20.0
+    openai_max_output_tokens: int = 1200
+
     opensearch_url: Optional[str] = None
     opensearch_username: Optional[str] = None
     opensearch_password: Optional[str] = None
@@ -29,11 +37,11 @@ class Settings(BaseSettings):
     audit_index: str = "soc-audit-v1"
 
     if SettingsConfigDict is not None:  # pragma: no cover - exercised with pydantic v2
-        model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+        model_config = SettingsConfigDict(env_file=("../.env", ".env"), env_file_encoding="utf-8")
 
     if SettingsConfigDict is None:  # pragma: no cover - pydantic v1 compatibility
         class Config:
-            env_file = ".env"
+            env_file = ("../.env", ".env")
             env_file_encoding = "utf-8"
 
 

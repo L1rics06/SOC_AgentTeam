@@ -74,6 +74,16 @@ class AgentEnvelope(BaseModel):
     created_at: Any = Field(default_factory=utc_now)
 
 
+class TeamMessage(BaseModel):
+    message_id: str
+    from_agent: str
+    to_agent: str
+    message_type: str = "note"
+    content: str
+    evidence_refs: List[EvidenceRef] = Field(default_factory=list)
+    created_at: Any = Field(default_factory=utc_now)
+
+
 class ReadinessReport(BaseModel):
     readiness_score: int = Field(ge=0, le=100)
     gate: ReadinessGate
@@ -109,6 +119,7 @@ class CaseState(BaseModel):
     labels: List[str] = Field(default_factory=list)
     evidence_refs: List[EvidenceRef] = Field(default_factory=list)
     readiness: Optional[ReadinessReport] = None
+    team_messages: List[TeamMessage] = Field(default_factory=list)
     agent_outputs: List[AgentEnvelope] = Field(default_factory=list)
     approvals: List[RecommendedAction] = Field(default_factory=list)
     final_report: Optional[str] = None
@@ -118,4 +129,3 @@ class CaseState(BaseModel):
 
 class CaseListResponse(BaseModel):
     cases: List[CaseState]
-
