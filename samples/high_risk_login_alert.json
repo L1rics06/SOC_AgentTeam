@@ -1,0 +1,30 @@
+{
+  "source_type": "opensearch_alert",
+  "source": "wazuh",
+  "index": "wazuh-alerts-4.x-2026.05.10",
+  "doc_id": "sample-high-risk-login-001",
+  "labels": ["demo", "high-risk-login"],
+  "raw_alert": {
+    "@timestamp": "2026-05-10T08:30:00Z",
+    "severity": "high",
+    "rule": {
+      "level": 12,
+      "description": "Multiple failed logins followed by success from unusual source"
+    },
+    "event": {
+      "action": "authentication_success_after_failures",
+      "category": "authentication"
+    },
+    "host": {
+      "name": "win-finance-07"
+    },
+    "user": {
+      "name": "zhang.wei"
+    },
+    "source": {
+      "ip": "203.0.113.77"
+    },
+    "message": "Suspicious login chain detected for privileged finance workstation"
+  }
+}
+
