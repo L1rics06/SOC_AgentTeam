@@ -1,3 +1,5 @@
+"""LLM Tool Registry：把内部 Python 能力暴露成 Chat Completions 工具。"""
+
 from __future__ import annotations
 
 import json
@@ -11,6 +13,8 @@ from .skills import SkillRegistry
 
 
 class ToolRegistry:
+    """为某个 Agent 提供可用工具定义、执行入口和调用摘要。"""
+
     def __init__(self, agent_name: str, case: CaseState, adapter: OpenSearchAdapter, mailbox: TeamMailbox, skills: SkillRegistry):
         self.agent_name = agent_name
         self.case = case
@@ -20,10 +24,12 @@ class ToolRegistry:
         self.calls: List[Dict[str, Any]] = []
 
     def definitions(self, allowed: List[str]) -> List[Dict[str, Any]]:
+        """根据 AgentSpec.allowed_tools 过滤出本轮可暴露给 LLM 的工具。"""
         all_definitions = self._definitions()
         return [all_definitions[name] for name in allowed if name in all_definitions]
 
     def execute(self, name: str, arguments: str) -> Dict[str, Any]:
+        """执行一次工具调用，统一处理 JSON 参数、异常和结果脱敏。"""
         try:
             args = json.loads(arguments or "{}")
         except json.JSONDecodeError:
@@ -72,6 +78,7 @@ class ToolRegistry:
         end: str | None = None,
         size: int = 20,
     ) -> Dict[str, Any]:
+        """按文本、实体和时间范围搜索事件日志。"""
         query = {
             "text": query_text,
             "hosts": hosts or [],
@@ -96,6 +103,7 @@ class ToolRegistry:
 
     @staticmethod
     def _compact(items: Any) -> Any:
+        """压缩 OpenSearch 命中结果，避免把过大的原始响应塞回 LLM 上下文。"""
         if not isinstance(items, list):
             return items
         compacted = []
@@ -115,11 +123,13 @@ class ToolRegistry:
 
     @staticmethod
     def _preview(value: Any) -> Any:
+        """生成工具调用记录中的短预览。"""
         text = json.dumps(value, ensure_ascii=False, default=str)
         return text[:500]
 
     @staticmethod
     def _definitions() -> Dict[str, Dict[str, Any]]:
+        """返回 Chat Completions tools 所需的 JSON Schema 定义。"""
         string_array = {"type": "array", "items": {"type": "string"}}
         return {
             "list_skills": {
@@ -229,4 +239,3 @@ class ToolRegistry:
                 },
             },
         }
-

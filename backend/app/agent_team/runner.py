@@ -1,3 +1,5 @@
+"""Agent Team Runner：编排多个 LLM Agent 协作完成 SOC Case 分析。"""
+
 from __future__ import annotations
 
 import json
@@ -14,6 +16,8 @@ from .tools import ToolRegistry
 
 
 class AgentTeamRunner:
+    """执行 Data Readiness、Team Leader、专家 Agent、Verifier 和 Report 的完整链路。"""
+
     def __init__(self, llm: Any, adapter: OpenSearchAdapter, repository: CaseRepository):
         self.llm = llm
         self.adapter = adapter
@@ -21,6 +25,7 @@ class AgentTeamRunner:
         self.skills = SkillRegistry()
 
     def run(self, case: CaseState) -> bool:
+        """运行多 Agent 调查流程；成功时直接修改传入的 CaseState。"""
         client = self.llm._get_client()
         if client is None:
             return False
@@ -28,6 +33,7 @@ class AgentTeamRunner:
         mailbox = TeamMailbox(case)
         mailbox.send("system", "all", "case_opened", f"Case {case.case_id} opened: {case.title}")
 
+        # 先做数据可用性判断，后续 Agent 的任务范围和置信度都受它约束。
         readiness_output = self._run_agent(client, AGENT_SPECS["data_readiness"], case, mailbox, None, [])
         if readiness_output is None:
             return False
@@ -53,6 +59,7 @@ class AgentTeamRunner:
         self._append_output(case, team_leader_output)
 
         tasks = self._planned_tasks(team_leader_output, readiness)
+        # Team Leader 负责派工；Mailbox 记录这些任务，供各专家 Agent 读取。
         for task in tasks:
             mailbox.send(
                 "team_leader",
@@ -65,6 +72,7 @@ class AgentTeamRunner:
 
         outputs = [readiness_output, team_leader_output]
         for name in tasks:
+            # 专家 Agent 逐个运行，前序输出会作为上下文传入后续 Agent。
             output = self._run_agent(client, AGENT_SPECS[name], case, mailbox, readiness, outputs)
             if output is None:
                 return False
@@ -74,6 +82,7 @@ class AgentTeamRunner:
                 self.repository.register_actions(case, output.recommended_actions)
 
         for name in ["verifier", "report"]:
+            # Verifier 做证据与策略校验，Report 在最后汇总成 analyst-facing 报告。
             output = self._run_agent(client, AGENT_SPECS[name], case, mailbox, readiness, outputs)
             if output is None:
                 return False
@@ -108,6 +117,7 @@ class AgentTeamRunner:
         readiness: Optional[ReadinessReport],
         prior_outputs: List[AgentEnvelope],
     ) -> Optional[AgentEnvelope]:
+        """调用一次 LLM Agent，并处理最多 6 轮工具调用。"""
         tool_registry = ToolRegistry(spec.name, case, self.adapter, mailbox, self.skills)
         tools = tool_registry.definitions(spec.allowed_tools)
         messages: List[Dict[str, Any]] = [
@@ -130,6 +140,7 @@ class AgentTeamRunner:
                 if not tool_calls:
                     return self._envelope_from_content(spec, case, readiness, message.content or "{}", tool_registry.calls)
 
+                # Chat Completions 需要把 assistant 的 tool_calls 和每个 tool 结果依次写回消息历史。
                 messages.append(
                     {
                         "role": "assistant",
@@ -163,6 +174,7 @@ class AgentTeamRunner:
         return None
 
     def _system_prompt(self, spec: AgentSpec) -> str:
+        """生成 Agent 的系统提示，包括角色、规则和预加载技能。"""
         preloaded = self.skills.preload(spec.required_skills)
         skill_block = "\n\n".join([f"## Skill: {name}\n{content}" for name, content in preloaded.items()])
         return (
@@ -190,6 +202,7 @@ class AgentTeamRunner:
         readiness: Optional[ReadinessReport],
         prior_outputs: List[AgentEnvelope],
     ) -> str:
+        """生成 Agent 的用户提示，把 Case、Mailbox、前序输出压成 JSON。"""
         entities = extract_entities(case.raw_alert)
         payload = {
             "task": self._task_for(spec, readiness),
@@ -223,6 +236,7 @@ class AgentTeamRunner:
 
     @staticmethod
     def _task_for(spec: AgentSpec, readiness: Optional[ReadinessReport]) -> str:
+        """根据 Agent 名称和 Readiness Gate 生成本轮任务说明。"""
         if spec.name == "data_readiness":
             return (
                 "Assess data quality. Return metadata.readiness_report with readiness_score, gate, gaps, "
@@ -247,6 +261,7 @@ class AgentTeamRunner:
         content: str,
         tool_calls: List[Dict[str, Any]],
     ) -> AgentEnvelope:
+        """把 LLM JSON 输出规范化为 AgentEnvelope，并补充运行元数据。"""
         try:
             payload = json.loads(content)
         except json.JSONDecodeError:
@@ -254,6 +269,7 @@ class AgentTeamRunner:
         if not isinstance(payload, dict):
             payload = {"summary": str(payload), "metadata": {}}
         metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        # 元数据统一记录运行时、模型、技能和工具调用，方便审计与排障。
         metadata = {
             **metadata,
             "agent_runtime": "multi_agent_llm_team",
@@ -282,6 +298,7 @@ class AgentTeamRunner:
         )
 
     def _readiness_from_output(self, output: AgentEnvelope) -> Optional[ReadinessReport]:
+        """从 Data Readiness Agent 的 metadata 中解析 ReadinessReport。"""
         raw = output.metadata.get("readiness_report")
         if not isinstance(raw, dict):
             return None
@@ -291,6 +308,7 @@ class AgentTeamRunner:
             return None
 
     def _planned_tasks(self, output: AgentEnvelope, readiness: ReadinessReport) -> List[str]:
+        """合并 Team Leader 建议任务和 Gate 要求，得到实际专家 Agent 队列。"""
         raw_tasks = output.metadata.get("tasks")
         if isinstance(raw_tasks, list):
             tasks = [str(task) for task in raw_tasks if str(task) in AGENT_SPECS]
@@ -309,9 +327,11 @@ class AgentTeamRunner:
         return ordered
 
     def _append_output(self, case: CaseState, output: AgentEnvelope) -> None:
+        """通过仓储追加 Agent 输出，保持 trace 写入一致。"""
         self.repository.append_agent_output(case, output)
 
     def _final_report(self, outputs: List[AgentEnvelope], case: CaseState) -> str:
+        """优先使用 Report Agent 生成的 final_report，否则降级拼接摘要。"""
         for output in reversed(outputs):
             report = output.metadata.get("final_report")
             if isinstance(report, str) and report.strip():
@@ -322,6 +342,7 @@ class AgentTeamRunner:
         return "\n".join(lines)
 
     def _recommended_actions(self, case_id: str, agent: str, raw_actions: Any) -> List[RecommendedAction]:
+        """清洗 LLM 返回的推荐动作，并强制中高风险动作需要审批。"""
         if not isinstance(raw_actions, list):
             return []
         actions: List[RecommendedAction] = []
@@ -349,6 +370,7 @@ class AgentTeamRunner:
 
     @staticmethod
     def _risk(value: Any) -> RiskLevel:
+        """把 LLM 返回的风险字符串转成枚举，异常时默认 medium。"""
         try:
             return RiskLevel(str(value).lower())
         except Exception:
@@ -356,18 +378,21 @@ class AgentTeamRunner:
 
     @staticmethod
     def _bounded_float(value: Any, default: float) -> float:
+        """把置信度限制在 0 到 1 之间。"""
         if isinstance(value, (int, float)):
             return max(0.0, min(1.0, float(value)))
         return max(0.0, min(1.0, default))
 
     @staticmethod
     def _text(value: Any, default: str) -> str:
+        """读取非空字符串并限制长度，避免超长 LLM 输出污染状态。"""
         if isinstance(value, str) and value.strip():
             return value.strip()[:1200]
         return default
 
     @staticmethod
     def _string_list(value: Any) -> List[str]:
+        """把列表字段规范化成最多 10 条短字符串。"""
         if not isinstance(value, list):
             return []
         return [str(item).strip()[:700] for item in value if str(item).strip()][:10]

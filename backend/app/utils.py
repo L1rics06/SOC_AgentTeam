@@ -1,3 +1,5 @@
+"""通用工具函数：时间、ID、脱敏、实体/IOC 提取和兼容性转换。"""
+
 from __future__ import annotations
 
 import hashlib
@@ -20,16 +22,19 @@ SENSITIVE_KEYS = {
 
 
 def utc_now() -> datetime:
+    """返回带 UTC 时区的当前时间。"""
     return datetime.now(timezone.utc)
 
 
 def short_id(prefix: str, seed: Optional[str] = None) -> str:
+    """基于种子生成稳定短 ID；无种子时使用当前时间。"""
     raw = seed or utc_now().isoformat()
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:10].upper()
     return f"{prefix}-{digest}"
 
 
 def model_to_dict(model: Any) -> Dict[str, Any]:
+    """兼容 Pydantic v1/v2，把模型转换为普通 dict。"""
     if hasattr(model, "model_dump"):
         return model.model_dump(mode="json")
     if hasattr(model, "dict"):
@@ -38,6 +43,7 @@ def model_to_dict(model: Any) -> Dict[str, Any]:
 
 
 def nested_get(data: Dict[str, Any], candidates: Iterable[str], default: Any = None) -> Any:
+    """按候选点号路径依次取值，返回第一个非空结果。"""
     for path in candidates:
         current: Any = data
         ok = True
@@ -53,6 +59,7 @@ def nested_get(data: Dict[str, Any], candidates: Iterable[str], default: Any = N
 
 
 def flatten(data: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
+    """把嵌套 dict 展平成点号路径，方便实体提取。"""
     out: Dict[str, Any] = {}
     for key, value in data.items():
         dotted = f"{prefix}.{key}" if prefix else key
@@ -64,6 +71,7 @@ def flatten(data: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
 
 
 def redact_sensitive(value: Any) -> Any:
+    """递归脱敏常见密钥、Token、Cookie 和密码字段。"""
     if isinstance(value, dict):
         clean: Dict[str, Any] = {}
         for key, item in value.items():
@@ -78,6 +86,7 @@ def redact_sensitive(value: Any) -> Any:
 
 
 def severity_to_score(raw: Any) -> int:
+    """把不同来源的严重级别表示统一映射到 0-100 分。"""
     if raw is None:
         return 0
     if isinstance(raw, (int, float)):
@@ -96,6 +105,7 @@ def severity_to_score(raw: Any) -> int:
 
 
 def extract_entities(alert: Dict[str, Any]) -> Dict[str, List[str]]:
+    """从告警中提取主机、用户、IP 和域名实体。"""
     flat = flatten(alert)
     entities: Dict[str, List[str]] = {"hosts": [], "users": [], "ips": [], "domains": []}
     for key, value in flat.items():
@@ -120,6 +130,7 @@ def extract_entities(alert: Dict[str, Any]) -> Dict[str, List[str]]:
 
 
 def extract_iocs(alert: Dict[str, Any]) -> Dict[str, List[str]]:
+    """提取常见 IOC：IP、域名和 MD5/SHA1/SHA256 哈希。"""
     text = str(alert)
     entities = extract_entities(alert)
     hashes = re.findall(r"\b[a-fA-F0-9]{32}\b|\b[a-fA-F0-9]{40}\b|\b[a-fA-F0-9]{64}\b", text)
@@ -131,8 +142,8 @@ def extract_iocs(alert: Dict[str, Any]) -> Dict[str, List[str]]:
 
 
 def first_non_empty(values: Iterable[Any], default: Any = None) -> Any:
+    """返回序列中的第一个非空值。"""
     for value in values:
         if value not in (None, "", [], {}):
             return value
     return default
-

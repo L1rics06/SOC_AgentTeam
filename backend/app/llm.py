@@ -1,3 +1,5 @@
+"""LLM 客户端封装：延迟初始化 OpenAI SDK，并暴露运行状态。"""
+
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
@@ -6,6 +8,8 @@ from .config import Settings
 
 
 class OpenAILLMClient:
+    """OpenAI Chat Completions 客户端的轻量包装。"""
+
     def __init__(self, settings: Settings):
         self.settings = settings
         self.model = settings.openai_model
@@ -14,6 +18,7 @@ class OpenAILLMClient:
         self._init_error: Optional[str] = None
 
     def _get_client(self) -> Optional[Any]:
+        """按需创建 SDK 客户端；配置缺失或初始化失败时返回 None。"""
         if not self.enabled:
             return None
         if self._client is not None:
@@ -40,6 +45,7 @@ class OpenAILLMClient:
         return self._client
 
     def status(self) -> Dict[str, Any]:
+        """返回给健康检查和审计日志使用的 LLM 配置摘要。"""
         return {
             "enabled": self.enabled,
             "configured": bool(self.settings.openai_api_key),
@@ -50,4 +56,5 @@ class OpenAILLMClient:
 
 
 def build_llm_client(settings: Settings) -> OpenAILLMClient:
+    """工厂函数，便于未来替换为其他 LLM Provider。"""
     return OpenAILLMClient(settings)

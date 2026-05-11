@@ -1,3 +1,5 @@
+"""Case 仓储：维护内存状态，并把关键变化同步到 OpenSearch 适配层。"""
+
 from __future__ import annotations
 
 from threading import RLock
@@ -19,6 +21,8 @@ from .utils import nested_get, redact_sensitive, short_id, utc_now
 
 
 class CaseRepository:
+    """线程安全的 Case 状态管理器。"""
+
     def __init__(self, adapter: OpenSearchAdapter, settings: Settings):
         self.adapter = adapter
         self.settings = settings
@@ -26,6 +30,7 @@ class CaseRepository:
         self._cases: Dict[str, CaseState] = {}
 
     def create_case(self, payload: IntakePayload) -> CaseState:
+        """清洗入站告警、生成稳定 Case ID，并写入 Case 与审计记录。"""
         with self._lock:
             raw_alert = redact_sensitive(payload.raw_alert)
             title = nested_get(
@@ -40,6 +45,7 @@ class CaseRepository:
                 ],
                 "SOC alert",
             )
+            # 使用来源、索引、文档 ID 和告警内容做种子，避免重复告警生成不同 Case ID。
             seed = f"{payload.source}:{payload.index}:{payload.doc_id}:{raw_alert}"
             case_id = short_id("CASE", seed)
             evidence = EvidenceRef(
@@ -64,14 +70,17 @@ class CaseRepository:
             return case
 
     def list_cases(self) -> List[CaseState]:
+        """按创建时间倒序返回 Case。"""
         with self._lock:
             return sorted(self._cases.values(), key=lambda case: case.created_at, reverse=True)
 
     def get_case(self, case_id: str) -> Optional[CaseState]:
+        """从内存状态中读取单个 Case。"""
         with self._lock:
             return self._cases.get(case_id)
 
     def save_case(self, case: CaseState) -> CaseState:
+        """更新 Case 的更新时间，并同步写入适配层。"""
         with self._lock:
             case.updated_at = utc_now()
             self._cases[case.case_id] = case
@@ -79,10 +88,12 @@ class CaseRepository:
             return case
 
     def append_agent_output(self, case: CaseState, output: AgentEnvelope) -> None:
+        """把 Agent 输出追加到 Case，同时记录 Agent trace。"""
         case.agent_outputs.append(output)
         self.adapter.write_agent_trace(case.case_id, output)
 
     def register_actions(self, case: CaseState, actions: List[RecommendedAction]) -> None:
+        """注册需要审批的推荐动作，并为缺少 ID 的动作补生成 action_id。"""
         known = {action.action_id for action in case.approvals}
         for action in actions:
             if not action.requires_approval:
@@ -94,6 +105,7 @@ class CaseRepository:
                 known.add(action.action_id)
 
     def update_approval(self, action_id: str, decision: ApprovalDecision) -> Optional[CaseState]:
+        """按 action_id 写入审批结论，并同步所有 Agent 输出中的动作状态。"""
         with self._lock:
             for case in self._cases.values():
                 target = None
@@ -126,6 +138,7 @@ class CaseRepository:
 
     @staticmethod
     def _resolve_status_after_approval(case: CaseState) -> CaseStatus:
+        """根据是否仍有待审批动作决定 Case 是否完成。"""
         pending = [action for action in case.approvals if action.status == ApprovalStatus.pending]
         if pending:
             return CaseStatus.awaiting_approval

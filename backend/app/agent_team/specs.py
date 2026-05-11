@@ -1,3 +1,5 @@
+"""Agent Team 规格：集中声明每个 SOC Agent 的角色、目标、技能和工具。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -6,6 +8,8 @@ from typing import Dict, List
 
 @dataclass(frozen=True)
 class AgentSpec:
+    """单个 Agent 的运行说明，用于生成系统提示和可用工具列表。"""
+
     name: str
     role: str
     goal: str
@@ -16,6 +20,7 @@ class AgentSpec:
 
 
 COMMON_TOOLS = [
+    # 所有 Agent 都能使用 Mailbox 和 Skill 工具进行协作与自我补充。
     "list_skills",
     "load_skill",
     "read_mailbox",
@@ -23,6 +28,7 @@ COMMON_TOOLS = [
 ]
 
 OPENSEARCH_TOOLS = [
+    # 需要证据检索的专家 Agent 才会开放这些 OpenSearch 工具。
     "opensearch_search_events",
     "opensearch_get_document",
     "opensearch_aggregate_timeline",
@@ -32,6 +38,7 @@ OPENSEARCH_TOOLS = [
 
 
 AGENT_SPECS: Dict[str, AgentSpec] = {
+    # Agent 执行顺序由 runner 编排；这里仅声明能力边界。
     "data_readiness": AgentSpec(
         name="data_readiness",
         role="SOC Data Readiness Agent",
@@ -99,4 +106,3 @@ AGENT_SPECS: Dict[str, AgentSpec] = {
         output_notes="metadata must include final_report as markdown.",
     ),
 }
-

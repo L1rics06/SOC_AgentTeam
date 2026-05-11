@@ -1,3 +1,5 @@
+"""应用配置：统一从环境变量和 .env 文件加载运行参数。"""
+
 from __future__ import annotations
 
 from functools import lru_cache
@@ -11,6 +13,8 @@ except ImportError:  # pragma: no cover - pydantic v1 compatibility
 
 
 class Settings(BaseSettings):
+    """后端服务、LLM、OpenSearch 和索引名称的集中配置。"""
+
     app_name: str = "AI+SOC Agent Team PoC"
     api_prefix: str = "/api/v1"
     cors_origins: List[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
@@ -47,4 +51,5 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
+    """缓存配置对象，避免每次请求重复解析环境变量。"""
     return Settings()
