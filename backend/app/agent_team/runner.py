@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Dict, List, Optional
 
 from ..models import AgentEnvelope, CaseState, CaseStatus, ReadinessGate, ReadinessReport, RecommendedAction, RiskLevel
@@ -32,14 +33,14 @@ class AgentTeamRunner:
 
         mailbox = TeamMailbox(case)
         mailbox.send("system", "all", "case_opened", f"Case {case.case_id} opened: {case.title}")
+        self.repository.save_case(case)
 
         # 先做数据可用性判断，后续 Agent 的任务范围和置信度都受它约束。
         readiness_output = self._run_agent(client, AGENT_SPECS["data_readiness"], case, mailbox, None, [])
         if readiness_output is None:
             return False
-        self._append_output(case, readiness_output)
 
-        readiness = self._readiness_from_output(readiness_output)
+        readiness = self._readiness_from_output(readiness_output, case)
         if readiness is None:
             self.adapter.write_audit_event(
                 case.case_id,
@@ -51,7 +52,10 @@ class AgentTeamRunner:
             )
             case.status = CaseStatus.failed
             return False
+        readiness_output.metadata["readiness_report"] = model_to_dict(readiness)
+        self._append_output(case, readiness_output)
         case.readiness = readiness
+        self.repository.save_case(case)
 
         team_leader_output = self._run_agent(client, AGENT_SPECS["team_leader"], case, mailbox, readiness, [readiness_output])
         if team_leader_output is None:
@@ -69,6 +73,7 @@ class AgentTeamRunner:
             )
         mailbox.send("team_leader", "verifier", "task", "Verify the expert outputs, evidence chain, and approval policy.")
         mailbox.send("team_leader", "report", "task", "Prepare the final report after verification.")
+        self.repository.save_case(case)
 
         outputs = [readiness_output, team_leader_output]
         for name in tasks:
@@ -80,6 +85,7 @@ class AgentTeamRunner:
             self._append_output(case, output)
             if output.recommended_actions:
                 self.repository.register_actions(case, output.recommended_actions)
+                self.repository.save_case(case)
 
         for name in ["verifier", "report"]:
             # Verifier 做证据与策略校验，Report 在最后汇总成 analyst-facing 报告。
@@ -127,13 +133,12 @@ class AgentTeamRunner:
 
         try:
             for _ in range(6):
-                response = client.chat.completions.create(
-                    model=self.llm.model,
+                response = self._create_chat_completion_with_retries(
+                    spec=spec,
+                    case=case,
                     messages=messages,
                     tools=tools,
-                    tool_choice="auto",
                     response_format={"type": "json_object"},
-                    max_tokens=self.llm.settings.openai_max_output_tokens,
                 )
                 message = response.choices[0].message
                 tool_calls = list(message.tool_calls or [])
@@ -173,6 +178,45 @@ class AgentTeamRunner:
             return None
         return None
 
+    def _create_chat_completion_with_retries(
+        self,
+        *,
+        spec: AgentSpec,
+        case: CaseState,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        response_format: Dict[str, Any],
+    ) -> Any:
+        """Call the LLM with short retries for transient provider failures."""
+        settings = getattr(self.llm, "settings", None)
+        attempts = max(1, int(getattr(settings, "llm_retry_attempts", 3)))
+        delay_seconds = max(0.0, float(getattr(settings, "llm_retry_delay_seconds", 0.8)))
+        last_error: Optional[Exception] = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return self.llm.create_chat_completion(
+                    messages=messages,
+                    tools=tools,
+                    response_format=response_format,
+                )
+            except Exception as exc:
+                last_error = exc
+                if attempt >= attempts:
+                    break
+                self.adapter.write_audit_event(
+                    case.case_id,
+                    {
+                        "type": "agent_llm_retry",
+                        "agent": spec.name,
+                        "attempt": attempt,
+                        "max_attempts": attempts,
+                        "error": str(exc),
+                    },
+                )
+                if delay_seconds:
+                    time.sleep(delay_seconds * attempt)
+        raise last_error or RuntimeError("LLM request failed")
+
     def _system_prompt(self, spec: AgentSpec) -> str:
         """生成 Agent 的系统提示，包括角色、规则和预加载技能。"""
         preloaded = self.skills.preload(spec.required_skills)
@@ -190,6 +234,8 @@ class AgentTeamRunner:
             "- Medium, high, and critical risk actions must require human approval.\n"
             "- Final answer must be strict JSON with keys: summary, key_findings, confidence, recommended_actions, "
             "policy_flags, needs_human_approval, metadata.\n"
+            "- key_findings must be a non-empty array of role-specific, evidence-backed findings. "
+            "If evidence is sparse, state the concrete data gap and the known alert fields instead of returning an empty list.\n"
             f"{spec.output_notes}\n\n"
             f"Preloaded skills:\n{skill_block}"
         )
@@ -249,7 +295,10 @@ class AgentTeamRunner:
         if spec.name == "verifier":
             return "Independently verify evidence support, policy compliance, and approval requirements."
         if spec.name == "report":
-            return "Write the final case report in metadata.final_report markdown using verified outputs."
+            return (
+                "Write a synthesized final case report in metadata.final_report markdown using verified outputs. "
+                "Do not concatenate agent summaries. Include a section named '## Important Signals'."
+            )
         gate = readiness.gate.value if readiness else "unknown"
         return f"Perform your expert SOC analysis for readiness gate {gate}."
 
@@ -262,18 +311,23 @@ class AgentTeamRunner:
         tool_calls: List[Dict[str, Any]],
     ) -> AgentEnvelope:
         """把 LLM JSON 输出规范化为 AgentEnvelope，并补充运行元数据。"""
-        try:
-            payload = json.loads(content)
-        except json.JSONDecodeError:
+        payload = self._json_payload(content)
+        if payload is None:
             payload = {"summary": content, "key_findings": [], "metadata": {"raw_response": content}}
         if not isinstance(payload, dict):
             payload = {"summary": str(payload), "metadata": {}}
         metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        if spec.name == "report" and not metadata.get("final_report"):
+            for key in ("final_report", "report_markdown", "report"):
+                candidate = payload.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    metadata["final_report"] = candidate.strip()
+                    break
         # 元数据统一记录运行时、模型、技能和工具调用，方便审计与排障。
         metadata = {
             **metadata,
             "agent_runtime": "multi_agent_llm_team",
-            "llm": {"used": True, "provider": "openai", "model": self.llm.model},
+            "llm": {"used": True, "provider": self.llm.status().get("provider", "unknown"), "model": self.llm.model},
             "skills": spec.required_skills,
             "tools": tool_calls,
         }
@@ -288,7 +342,7 @@ class AgentTeamRunner:
             task_id=short_id("TASK", f"{case.case_id}:{spec.name}:llm-team"),
             readiness_gate=gate,
             summary=self._text(payload.get("summary"), f"{spec.name} completed."),
-            key_findings=self._string_list(payload.get("key_findings")) or ["No role-specific finding returned."],
+            key_findings=self._findings_from_payload(payload, spec.name, case, readiness),
             evidence_refs=list(case.evidence_refs),
             confidence=confidence,
             recommended_actions=actions,
@@ -297,15 +351,211 @@ class AgentTeamRunner:
             metadata=metadata,
         )
 
-    def _readiness_from_output(self, output: AgentEnvelope) -> Optional[ReadinessReport]:
+    def _readiness_from_output(self, output: AgentEnvelope, case: CaseState) -> Optional[ReadinessReport]:
         """从 Data Readiness Agent 的 metadata 中解析 ReadinessReport。"""
         raw = output.metadata.get("readiness_report")
         if not isinstance(raw, dict):
-            return None
+            recovered = self._fallback_readiness_report(case)
+            self.adapter.write_audit_event(
+                case.case_id,
+                {
+                    "type": "readiness_report_recovered",
+                    "agent": output.agent,
+                    "reason": "Agent output omitted metadata.readiness_report; derived a data-readiness gate from alert fields.",
+                },
+            )
+            return recovered
         try:
             return ReadinessReport(**raw)
         except Exception:
             return None
+
+    @staticmethod
+    def _json_payload(content: str) -> Optional[Dict[str, Any]]:
+        """Parse a JSON object, including common prose-wrapped JSON responses."""
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError:
+            start = content.find("{")
+            end = content.rfind("}")
+            if start < 0 or end <= start:
+                return None
+            try:
+                payload = json.loads(content[start : end + 1])
+            except json.JSONDecodeError:
+                return None
+        return payload if isinstance(payload, dict) else None
+
+    def _findings_from_payload(
+        self,
+        payload: Dict[str, Any],
+        agent: str,
+        case: CaseState,
+        readiness: Optional[ReadinessReport],
+    ) -> List[str]:
+        """Read model findings with common aliases, then fall back to alert-grounded role findings."""
+        candidates = [
+            payload.get("key_findings"),
+            payload.get("findings"),
+            payload.get("keyFindings"),
+            payload.get("key_points"),
+        ]
+        metadata = payload.get("metadata")
+        if isinstance(metadata, dict):
+            candidates.extend(
+                [
+                    metadata.get("key_findings"),
+                    metadata.get("findings"),
+                    metadata.get("keyFindings"),
+                    metadata.get("key_points"),
+                ]
+            )
+        for candidate in candidates:
+            findings = self._finding_list(candidate)
+            if findings:
+                return findings
+        return self._fallback_key_findings(agent, case, readiness)
+
+    def _fallback_key_findings(
+        self,
+        agent: str,
+        case: CaseState,
+        readiness: Optional[ReadinessReport],
+    ) -> List[str]:
+        """Create useful, evidence-bound findings when the LLM omits role findings."""
+        alert = case.raw_alert
+        entities = extract_entities(alert)
+        description = self._text(
+            nested_get(alert, ["rule.description", "message", "event.action", "alert.title"]),
+            case.title,
+        )
+        action = nested_get(alert, ["event.action"], "unknown_action")
+        category = nested_get(alert, ["event.category"], "unknown_category")
+        timestamp = nested_get(alert, ["@timestamp", "timestamp", "event.created"], "unknown_time")
+        severity = nested_get(alert, ["severity", "rule.level"], "unknown_severity")
+        hosts = self._format_entities(entities.get("hosts", []), "no host")
+        users = self._format_entities(entities.get("users", []), "no user")
+        ips = self._format_entities(entities.get("ips", []), "no source IP")
+        evidence = self._format_evidence(case)
+        gaps = ", ".join(readiness.gaps) if readiness and readiness.gaps else "no readiness gaps recorded"
+        alert_text = f"{description} {action} {category}".lower()
+        is_auth_case = "auth" in alert_text or "login" in alert_text
+        is_login_chain = ("failed" in alert_text and "success" in alert_text) or "success_after_failures" in alert_text
+        case_type = "authentication" if is_auth_case else str(category)
+        timeline_finding = (
+            f"Known sequence from the alert is {description} at {timestamp}."
+            if is_login_chain
+            else f"Known event from the alert is {description} at {timestamp}."
+        )
+        timeline_correlation = (
+            f"Event action is {action} in category {category}; adjacent failed-login and success logs should be correlated around this time."
+            if is_login_chain
+            else f"Event action is {action} in category {category}; related events should be correlated around this time."
+        )
+        response_scope = (
+            f"Account/session review for user {users} and host {hosts} is the immediate response scope supported by the alert."
+            if is_auth_case
+            else f"Response scope supported by the alert is user {users}, host {hosts}, and source IP {ips}."
+        )
+        report_focus = (
+            f"Report should highlight the failed-login-to-success chain, source IP {ips}, user {users}, and host {hosts}."
+            if is_login_chain
+            else f"Report should highlight alert '{description}', source IP {ips}, user {users}, and host {hosts}."
+        )
+
+        findings_by_agent: Dict[str, List[str]] = {
+            "data_readiness": [
+                f"Original {case.source} alert provides timestamp {timestamp}, severity {severity}, user {users}, host {hosts}, and source IP {ips}.",
+                f"Evidence anchor is {evidence}; readiness gaps: {gaps}.",
+            ],
+            "team_leader": [
+                f"Alert class is an authentication chain: {description}.",
+                "Investigation should cover triage, timeline, impact, threat intel, and approval-gated response planning.",
+            ],
+            "triage": [
+                f"{severity} {case_type} alert states: {description}.",
+                f"Known target context is user {users} on host {hosts} from source IP {ips}.",
+            ],
+            "intel": [
+                f"Source IP {ips} and account {users} are the primary enrichment targets for unusual-source login analysis.",
+                "No reputation verdict is present in the alert payload, so intel confidence should remain bounded until enrichment is returned.",
+            ],
+            "timeline": [
+                timeline_finding,
+                timeline_correlation,
+            ],
+            "impact": [
+                f"Currently confirmed affected entities are user {users} and host {hosts}.",
+                "Blast radius beyond the listed account, host, and source IP is not confirmed by the current evidence.",
+            ],
+            "response": [
+                "Response should preserve authentication evidence and avoid disruptive containment without analyst approval.",
+                response_scope,
+            ],
+            "verifier": [
+                f"Current support comes from {evidence} and the alert text: {description}.",
+                "Claims about attacker reputation, lateral movement, or broader compromise require corroborating logs before being treated as verified.",
+            ],
+            "report": [
+                report_focus,
+                "Confidence limits and any approval-gated response actions should be explicit in the final case summary.",
+            ],
+        }
+        return findings_by_agent.get(
+            agent,
+            [f"Alert evidence for {agent}: {description}; entities are user {users}, host {hosts}, source IP {ips}."],
+        )
+
+    @staticmethod
+    def _fallback_readiness_report(case: CaseState) -> ReadinessReport:
+        """Create a conservative data-readiness gate from fields already present in the alert."""
+        entities = extract_entities(case.raw_alert)
+        timestamp = nested_get(case.raw_alert, ["@timestamp", "timestamp", "event.created"])
+        severity = nested_get(case.raw_alert, ["severity", "rule.level"])
+        message = nested_get(case.raw_alert, ["rule.description", "message", "event.action", "alert.title"])
+        gaps: List[str] = []
+        if not timestamp:
+            gaps.append("missing_timestamp")
+        if not severity:
+            gaps.append("missing_severity")
+        if not message:
+            gaps.append("missing_alert_description")
+        if not entities.get("hosts"):
+            gaps.append("missing_host_entity")
+        if not entities.get("users"):
+            gaps.append("missing_user_entity")
+        if not entities.get("ips"):
+            gaps.append("missing_ip_entity")
+        if not case.evidence_refs:
+            gaps.append("missing_evidence_reference")
+
+        score = max(25, 90 - len(gaps) * 10)
+        if score >= 75:
+            gate = ReadinessGate.allow
+            confidence_cap = 0.8
+            allowed_actions = ["run_full_agent_team", "recommend_approval_gated_response"]
+        elif score >= 50:
+            gate = ReadinessGate.limited
+            confidence_cap = 0.65
+            allowed_actions = ["run_limited_agent_team", "request_missing_evidence"]
+        else:
+            gate = ReadinessGate.triage_only
+            confidence_cap = 0.45
+            allowed_actions = ["triage_only", "request_missing_evidence"]
+
+        return ReadinessReport(
+            readiness_score=score,
+            gate=gate,
+            gaps=gaps,
+            allowed_actions=allowed_actions,
+            confidence_cap=confidence_cap,
+            normalized_fields={
+                "timestamp": timestamp,
+                "severity": severity,
+                "message": message,
+                "entities": entities,
+            },
+        )
 
     def _planned_tasks(self, output: AgentEnvelope, readiness: ReadinessReport) -> List[str]:
         """合并 Team Leader 建议任务和 Gate 要求，得到实际专家 Agent 队列。"""
@@ -331,15 +581,130 @@ class AgentTeamRunner:
         self.repository.append_agent_output(case, output)
 
     def _final_report(self, outputs: List[AgentEnvelope], case: CaseState) -> str:
-        """优先使用 Report Agent 生成的 final_report，否则降级拼接摘要。"""
+        """Prefer Report Agent markdown; otherwise synthesize a structured report."""
         for output in reversed(outputs):
             report = output.metadata.get("final_report")
             if isinstance(report, str) and report.strip():
-                return report
-        lines = [f"# Case {case.case_id}: {case.title}", "", "## Agent Team Findings"]
-        for output in outputs:
-            lines.append(f"- {output.agent}: {output.summary}")
+                return self._ensure_important_signals(report.strip(), outputs, case)
+        for output in reversed(outputs):
+            raw_report = output.metadata.get("raw_response")
+            if output.agent == "report" and isinstance(raw_report, str) and self._looks_like_report(raw_report):
+                return self._ensure_important_signals(raw_report.strip(), outputs, case)
+        return self._synthesized_final_report(outputs, case)
+
+    def _synthesized_final_report(self, outputs: List[AgentEnvelope], case: CaseState) -> str:
+        """Build a readable report from structured outputs when the report agent omits markdown."""
+        summary = self._best_summary(outputs)
+        lines = [
+            f"# Case {case.case_id}: {case.title}",
+            "",
+            "## Executive Summary",
+            summary,
+            "",
+            "## Important Signals",
+        ]
+        lines.extend(f"- {signal}" for signal in self._important_signals(outputs, case))
+
+        if case.readiness:
+            gaps = ", ".join(case.readiness.gaps) if case.readiness.gaps else "none"
+            lines.extend(
+                [
+                    "",
+                    "## Readiness",
+                    f"- Score: {case.readiness.readiness_score}",
+                    f"- Gate: {case.readiness.gate.value}",
+                    f"- Gaps: {gaps}",
+                    f"- Confidence cap: {case.readiness.confidence_cap:.2f}",
+                ]
+            )
+
+        findings = self._key_findings_by_agent(outputs)
+        if findings:
+            lines.extend(["", "## Key Findings"])
+            lines.extend(findings)
+
+        actions = self._recommended_action_lines(outputs)
+        if actions:
+            lines.extend(["", "## Recommended Actions"])
+            lines.extend(actions)
+
+        verifier = next((output for output in reversed(outputs) if output.agent == "verifier"), None)
+        if verifier:
+            flags = ", ".join(verifier.policy_flags) if verifier.policy_flags else "none"
+            lines.extend(["", "## Verification", f"- {verifier.summary}", f"- Policy flags: {flags}"])
+
         return "\n".join(lines)
+
+    def _ensure_important_signals(self, report: str, outputs: List[AgentEnvelope], case: CaseState) -> str:
+        """Guarantee that every final report exposes an Important Signals section."""
+        if "important signals" in report.lower():
+            return report
+        signals = "\n".join(f"- {signal}" for signal in self._important_signals(outputs, case))
+        return f"{report.rstrip()}\n\n## Important Signals\n{signals}"
+
+    @staticmethod
+    def _looks_like_report(text: str) -> bool:
+        lower = text.lower()
+        return "# " in text or "\n## " in text or "important signals" in lower or "executive summary" in lower
+
+    def _best_summary(self, outputs: List[AgentEnvelope]) -> str:
+        for preferred in ("verifier", "response", "triage"):
+            output = next((item for item in reversed(outputs) if item.agent == preferred), None)
+            if output and output.summary:
+                return output.summary
+        for output in reversed(outputs):
+            if output.agent != "report" and output.summary:
+                return output.summary
+        return outputs[-1].summary if outputs else "No agent conclusion was returned."
+
+    def _important_signals(self, outputs: List[AgentEnvelope], case: CaseState) -> List[str]:
+        signals: List[str] = []
+        for action in case.approvals:
+            if action.status.value == "pending" and action.risk in {RiskLevel.high, RiskLevel.critical}:
+                signals.append(f"{action.risk.value.upper()} approval required: {action.title}")
+        for output in outputs:
+            for flag in output.policy_flags:
+                signals.append(f"Policy flag from {output.agent}: {flag}")
+        for agent in ("response", "impact", "triage", "intel", "timeline", "verifier"):
+            output = next((item for item in reversed(outputs) if item.agent == agent), None)
+            if output:
+                signals.extend(f"{agent}: {finding}" for finding in output.key_findings[:2])
+        if case.readiness:
+            signals.extend(f"Data gap: {gap}" for gap in case.readiness.gaps)
+        return self._unique_lines(signals)[:8] or ["No high-priority signal was returned by the agent team."]
+
+    def _key_findings_by_agent(self, outputs: List[AgentEnvelope]) -> List[str]:
+        findings: List[str] = []
+        for output in outputs:
+            for finding in output.key_findings[:3]:
+                findings.append(f"- {output.agent}: {finding}")
+        return self._unique_lines(findings)[:18]
+
+    def _recommended_action_lines(self, outputs: List[AgentEnvelope]) -> List[str]:
+        lines: List[str] = []
+        seen_actions = set()
+        for output in outputs:
+            for action in output.recommended_actions:
+                key = action.action_id or f"{action.action_type}:{action.title}"
+                if key in seen_actions:
+                    continue
+                seen_actions.add(key)
+                approval = "requires approval" if action.requires_approval else "no approval required"
+                lines.append(f"- [{action.risk.value}] {action.title} ({approval}): {action.description}")
+        return lines
+
+    @staticmethod
+    def _unique_lines(values: List[str]) -> List[str]:
+        seen = set()
+        unique_values: List[str] = []
+        for value in values:
+            normalized = value.strip()
+            key = normalized.lower()
+            if not normalized or key in seen:
+                continue
+            seen.add(key)
+            unique_values.append(normalized)
+        return unique_values
 
     def _recommended_actions(self, case_id: str, agent: str, raw_actions: Any) -> List[RecommendedAction]:
         """清洗 LLM 返回的推荐动作，并强制中高风险动作需要审批。"""
@@ -396,3 +761,42 @@ class AgentTeamRunner:
         if not isinstance(value, list):
             return []
         return [str(item).strip()[:700] for item in value if str(item).strip()][:10]
+
+    @classmethod
+    def _finding_list(cls, value: Any) -> List[str]:
+        """Normalize common LLM finding shapes into short finding strings."""
+        if isinstance(value, str):
+            parts = [part.strip(" -*\t") for part in value.splitlines()]
+            if len(parts) <= 1:
+                parts = [part.strip(" -*\t") for part in value.split(";")]
+            return [part[:700] for part in parts if part][:10]
+        if isinstance(value, dict):
+            value = value.get("items") or value.get("findings") or value.get("key_findings")
+        if isinstance(value, (list, tuple)):
+            findings: List[str] = []
+            for item in value:
+                if isinstance(item, dict):
+                    item = item.get("finding") or item.get("summary") or item.get("text") or item.get("title")
+                text = str(item).strip()
+                if text:
+                    findings.append(text[:700])
+            return findings[:10]
+        return []
+
+    @staticmethod
+    def _format_entities(values: List[str], empty: str) -> str:
+        if not values:
+            return empty
+        return ", ".join(values[:3])
+
+    @staticmethod
+    def _format_evidence(case: CaseState) -> str:
+        if not case.evidence_refs:
+            return "the in-memory case payload"
+        ref = case.evidence_refs[0]
+        parts = [ref.source]
+        if ref.index:
+            parts.append(f"index {ref.index}")
+        if ref.doc_id:
+            parts.append(f"document {ref.doc_id}")
+        return " / ".join(parts)

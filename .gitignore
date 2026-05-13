@@ -8,3 +8,4 @@ node_modules/
 dist/
 .vite/
 .npm-cache/
+/backend/app/config.py

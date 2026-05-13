@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     openai_model: str = "gpt-4o-mini"
     siliconflow_api_key: Optional[str] = None
     siliconflow_base_url: str = "https://api.siliconflow.cn/v1"
-    siliconflow_model: str = "Pro/moonshotai/Kimi-K2.6"
+    siliconflow_model: str = "deepseek-ai/DeepSeek-V4-Flash"
     openai_timeout_seconds: float = 20.0
     openai_max_output_tokens: int = 1200
     llm_retry_attempts: int = 3

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Dict, Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import get_settings
@@ -28,6 +28,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _run_case_background(case_id: str) -> None:
+    """Run an Agent Team analysis after the API returns the live case state."""
+    case = repository.get_case(case_id)
+    if not case:
+        return
+    try:
+        workflow.run(case, reset=False)
+    except Exception as exc:
+        latest = repository.get_case(case_id) or case
+        latest.status = CaseStatus.failed
+        repository.save_case(latest)
+        adapter.write_audit_event(case_id, {"type": "background_case_run_failed", "error": str(exc)})
 
 
 @app.get("/health")
@@ -88,17 +102,16 @@ def opensearch_webhook(payload: Dict[str, Any]) -> CaseState:
 
 
 @app.post(f"{settings.api_prefix}/cases/{{case_id}}/run", response_model=CaseState)
-def run_case(case_id: str) -> CaseState:
+def run_case(case_id: str, background_tasks: BackgroundTasks) -> CaseState:
     """对已存在 Case 手动触发一次 Agent Team 分析。"""
     case = repository.get_case(case_id)
     if not case:
         raise HTTPException(status_code=404, detail="Case not found")
-    try:
-        return workflow.run(case)
-    except Exception as exc:
-        case.status = CaseStatus.failed
-        repository.save_case(case)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    if case.status == CaseStatus.running:
+        return case
+    case = repository.start_case_run(case)
+    background_tasks.add_task(_run_case_background, case_id)
+    return case
 
 
 @app.get(f"{settings.api_prefix}/cases/{{case_id}}", response_model=CaseState)

@@ -14,10 +14,13 @@ from app.workflow import AgentWorkflow
 class FakeLLM:
     enabled = True
     model = "fake-soc-agent-model"
-    settings = SimpleNamespace(openai_max_output_tokens=1200)
+    max_output_tokens = 1200
+    settings = SimpleNamespace(openai_max_output_tokens=1200, llm_retry_attempts=3, llm_retry_delay_seconds=0)
 
-    def __init__(self, missing_readiness=False):
+    def __init__(self, missing_readiness=False, missing_report=False, missing_findings=False):
         self.missing_readiness = missing_readiness
+        self.missing_report = missing_report
+        self.missing_findings = missing_findings
         self.client = FakeOpenAIClient(self)
 
     def _get_client(self):
@@ -26,12 +29,34 @@ class FakeLLM:
     def status(self):
         return {"enabled": self.enabled, "configured": True, "model": self.model, "provider": "fake"}
 
+    def create_chat_completion(self, *, messages, tools=None, response_format=None):
+        return self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            tools=tools or [],
+            tool_choice="auto",
+            response_format=response_format,
+            max_tokens=self.max_output_tokens,
+        )
+
 
 class DisabledLLM(FakeLLM):
     enabled = False
 
     def status(self):
         return {"enabled": False, "configured": False, "model": self.model, "provider": "fake"}
+
+
+class FlakyLLM(FakeLLM):
+    def __init__(self):
+        super().__init__()
+        self.failures_remaining = 1
+
+    def create_chat_completion(self, *, messages, tools=None, response_format=None):
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            raise RuntimeError("temporary provider error")
+        return super().create_chat_completion(messages=messages, tools=tools, response_format=response_format)
 
 
 class FakeOpenAIClient:
@@ -56,6 +81,8 @@ class FakeOpenAIClient:
             "needs_human_approval": False,
             "metadata": {},
         }
+        if self.llm.missing_findings:
+            base["key_findings"] = []
         if agent == "data_readiness" and not self.llm.missing_readiness:
             base["metadata"]["readiness_report"] = {
                 "readiness_score": 86,
@@ -86,7 +113,7 @@ class FakeOpenAIClient:
         if agent == "verifier":
             base["policy_flags"] = ["high_risk_action_requires_human_approval"]
             base["needs_human_approval"] = True
-        if agent == "report":
+        if agent == "report" and not self.llm.missing_report:
             base["metadata"]["final_report"] = "# SOC Agent Team Report\n\nVerified LLM agent-team output."
         return base
 
@@ -179,11 +206,77 @@ def test_workflow_fails_when_llm_team_is_not_configured():
     assert repository.get_case(case.case_id).status == CaseStatus.failed
 
 
-def test_missing_readiness_report_fails_without_local_analysis_path():
+def test_missing_readiness_report_recovers_with_data_gate():
     workflow, repository = make_workflow(llm=FakeLLM(missing_readiness=True))
     case = make_case(repository, doc_id="doc-bad-readiness")
 
-    with pytest.raises(RuntimeError, match="LLM agent team failed"):
-        workflow.run(case)
+    updated = workflow.run(case)
 
-    assert repository.get_case(case.case_id).status == CaseStatus.failed
+    assert updated.status == CaseStatus.awaiting_approval
+    assert updated.readiness is not None
+    assert updated.readiness.gate.value == "allow"
+    assert any(item["event"]["type"] == "readiness_report_recovered" for item in repository.adapter.audit)
+
+
+def test_empty_llm_findings_fall_back_to_role_specific_alert_findings():
+    workflow, repository = make_workflow(llm=FakeLLM(missing_findings=True))
+    case = make_case(repository, doc_id="doc-empty-findings")
+    case.raw_alert["rule"]["description"] = "Multiple failed logins followed by success from unusual source"
+    case.raw_alert["event"] = {"action": "authentication_success_after_failures", "category": "authentication"}
+
+    updated = workflow.run(case)
+
+    all_findings = [finding for output in updated.agent_outputs for finding in output.key_findings]
+    assert "No role-specific finding returned." not in all_findings
+    triage = next(output for output in updated.agent_outputs if output.agent == "triage")
+    timeline = next(output for output in updated.agent_outputs if output.agent == "timeline")
+    response = next(output for output in updated.agent_outputs if output.agent == "response")
+    assert any("Multiple failed logins followed by success from unusual source" in item for item in triage.key_findings)
+    assert any("Known sequence" in item and "Multiple failed logins followed by success" in item for item in timeline.key_findings)
+    assert any("zhang.wei" in item and "win-finance-07" in item for item in response.key_findings)
+
+
+def test_rerun_starts_from_clean_agent_outputs():
+    workflow, repository = make_workflow()
+    case = make_case(repository, doc_id="doc-rerun")
+
+    first = workflow.run(case)
+    second = workflow.run(first)
+
+    assert [output.agent for output in second.agent_outputs] == [
+        "data_readiness",
+        "team_leader",
+        "triage",
+        "intel",
+        "timeline",
+        "impact",
+        "response",
+        "verifier",
+        "report",
+    ]
+    assert len(second.agent_outputs) == 9
+    assert any(
+        item["event"]["type"] == "case_run_started" and item["event"]["cleared"]["agent_outputs"] == 9
+        for item in repository.adapter.audit
+    )
+
+
+def test_final_report_fallback_includes_important_signals():
+    workflow, repository = make_workflow(llm=FakeLLM(missing_report=True))
+    case = make_case(repository, doc_id="doc-missing-report")
+
+    updated = workflow.run(case)
+
+    assert "## Important Signals" in updated.final_report
+    assert "HIGH approval required: Review host isolation" in updated.final_report
+    assert "## Agent Team Findings" not in updated.final_report
+
+
+def test_transient_llm_failure_is_retried():
+    workflow, repository = make_workflow(llm=FlakyLLM())
+    case = make_case(repository, doc_id="doc-flaky")
+
+    updated = workflow.run(case)
+
+    assert updated.status == CaseStatus.awaiting_approval
+    assert any(item["event"]["type"] == "agent_llm_retry" for item in repository.adapter.audit)

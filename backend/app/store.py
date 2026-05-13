@@ -87,10 +87,36 @@ class CaseRepository:
             self.adapter.write_case_state(case.case_id, case)
             return case
 
+    def start_case_run(self, case: CaseState) -> CaseState:
+        """Start a clean analysis run and discard partial outputs from earlier attempts."""
+        with self._lock:
+            cleared = {
+                "agent_outputs": len(case.agent_outputs),
+                "team_messages": len(case.team_messages),
+                "approvals": len(case.approvals),
+                "had_readiness": case.readiness is not None,
+                "had_final_report": bool(case.final_report),
+            }
+            case.status = CaseStatus.running
+            case.readiness = None
+            case.team_messages = []
+            case.agent_outputs = []
+            case.approvals = []
+            case.final_report = None
+            case.updated_at = utc_now()
+            self._cases[case.case_id] = case
+            self.adapter.write_audit_event(case.case_id, {"type": "case_run_started", "cleared": cleared})
+            self.adapter.write_case_state(case.case_id, case)
+            return case
+
     def append_agent_output(self, case: CaseState, output: AgentEnvelope) -> None:
         """把 Agent 输出追加到 Case，同时记录 Agent trace。"""
-        case.agent_outputs.append(output)
-        self.adapter.write_agent_trace(case.case_id, output)
+        with self._lock:
+            case.agent_outputs.append(output)
+            case.updated_at = utc_now()
+            self._cases[case.case_id] = case
+            self.adapter.write_agent_trace(case.case_id, output)
+            self.adapter.write_case_state(case.case_id, case)
 
     def register_actions(self, case: CaseState, actions: List[RecommendedAction]) -> None:
         """注册需要审批的推荐动作，并为缺少 ID 的动作补生成 action_id。"""

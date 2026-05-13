@@ -18,10 +18,13 @@ class AgentWorkflow:
         self.llm = llm or build_llm_client(repository.settings)
         self.agent_team = AgentTeamRunner(self.llm, adapter, repository)
 
-    def run(self, case: CaseState) -> CaseState:
+    def run(self, case: CaseState, *, reset: bool = True) -> CaseState:
         """运行一次 Case 分析，并把状态变化持久化到仓储和审计日志。"""
-        case.status = CaseStatus.running
-        self.repository.save_case(case)
+        if reset:
+            case = self.repository.start_case_run(case)
+        else:
+            case.status = CaseStatus.running
+            self.repository.save_case(case)
 
         if not self.llm.enabled:
             # 当前实现强依赖 LLM；未配置时显式失败，避免给出伪分析结果。

@@ -105,6 +105,7 @@ npm.cmd run dev
 OPENAI_ENABLED=true
 OPENAI_API_KEY=sk-...
 OPENAI_MODEL=gpt-4o-mini
+SILICONFLOW_MODEL=deepseek-ai/DeepSeek-V4-Flash
 
 DEMO_MODE=false
 OPENSEARCH_URL=https://your-opensearch:9200

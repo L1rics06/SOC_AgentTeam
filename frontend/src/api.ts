@@ -22,6 +22,10 @@ export async function listCases(): Promise<CaseState[]> {
   return data.cases;
 }
 
+export async function getCase(caseId: string): Promise<CaseState> {
+  return request<CaseState>(`/api/v1/cases/${caseId}`);
+}
+
 export async function createDemoCase(): Promise<CaseState> {
   return request<CaseState>("/api/v1/cases/intake", {
     method: "POST",
@@ -65,4 +69,3 @@ export async function decideApproval(
     body: JSON.stringify({ decision, approver })
   });
 }
-
